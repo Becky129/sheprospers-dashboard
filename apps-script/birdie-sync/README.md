@@ -19,9 +19,9 @@ The script reads all IDs from **AI CONTROL CENTER**. The IDs in `CONFIG.FALLBACK
   - follow rate below 1.0 per 1K views (latest SNAPSHOTS reading; POST LOG is used when a post has no snapshot)
   - a post with 1,000+ views but no follows recorded
   - 3-second retention below 70%
+  - an AUDIENCE reading below target: female < 70%, age 45+ < 60% or US < 80%
 - `RESEARCH QUEUE`: finished CREATIVE TESTS and SHOP CREATIVE TESTS, waiting for a human to decide whether they become a rule (BR-11).
 - `AI RECOMMENDATIONS › Decision / notes`: results Becky types in Audit › CREATIVE TESTS for `AUTO-` tests.
-  - an AUDIENCE reading below target: female < 70%, age 45+ < 60% or US < 80%
 - `AUDIT KNOWLEDGE` (new tab, read-only, written by the script): a copy of VISUAL STYLE GUIDE, CREATOR TRAINING LAB, VIDEO PRODUCTION SPECS, SEO & HOOKS, COMMENT INSIGHTS and INSPIRATION BANK. It's refreshed whenever one of those tabs changes.
 - `APPROVAL QUEUE` (*Pending review*): each **new** row in INSPIRATION BANK, CREATOR TRAINING LAB or VISUAL STYLE GUIDE becomes a `KNOW-…` proposal. Rows that already exist at the first sync are treated as seen. To queue them too, set `QUEUE_EXISTING_KNOWLEDGE_ON_FIRST_SYNC: true` before the first run.
 - `VIDEO EDITING RULES`: when you set a `KNOW-…` proposal to **Approved**, it's added here once, using its Audit ID (e.g. `TR-15`). It then reaches the Audit workbook through `BIRDIE SYNC`.
