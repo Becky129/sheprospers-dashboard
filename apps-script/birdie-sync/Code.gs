@@ -1,37 +1,43 @@
 /**
- * Birdie Brain ⇄ Becky in Midlife Audit — two-way sync
- * ----------------------------------------------------
+ * Birdie Brain ⇄ Becky in Midlife Audit — two-way sync          (v2, 2026-11-21)
+ * ------------------------------------------------------------------------------
  * Install in: Birdie Brain | AI Editing & Marketing Playbook | Live
  *             (Extensions › Apps Script, paste this file as Code.gs)
  *
- * What it does on each run (daily trigger + "Birdie Sync" menu):
+ * Each run (daily ~8:00 a.m. Eastern + "Birdie Sync" menu):
  *
  *   AUDIT ➜ BRAIN (performance facts)
  *     • Fingerprints each watched Audit tab; only changed tabs are processed.
- *       Every change is logged in SYNC SNAPSHOTS.
- *     • Runs fixed, rule-based checks on the changed data (follow rate,
- *       3-second retention, missing follows, finished tests). Results go to
- *       AI RECOMMENDATIONS / RESEARCH QUEUE as "Pending review". Nothing is
- *       promoted to a rule on its own.
- *     • Copies results Becky enters in Audit › CREATIVE TESTS for AUTO-
- *       experiments back to AI RECOMMENDATIONS › Decision / notes.
- *     • Refreshes the "Auto ·" rows in TODAY BRIEFING. Rows Becky typed
- *       herself are never touched.
+ *     • Rule-based checks (follow rate, 3-sec retention, missing follows on
+ *       logged posts, audience fit, finished tests) go to AI RECOMMENDATIONS /
+ *       RESEARCH QUEUE as "Pending review". Nothing becomes a rule on its own.
+ *     • Results Becky enters for AUTO- tests in Audit › CREATIVE TESTS are
+ *       copied back to AI RECOMMENDATIONS › Decision / notes.
+ *     • The six knowledge tabs are copied into Brain › AUDIT KNOWLEDGE. New
+ *       Inspiration / Training / Visual rows are proposed in APPROVAL QUEUE.
+ *     • Only "Auto ·" rows in TODAY BRIEFING are written. No other cell there
+ *       is ever touched.
  *
  *   BRAIN ➜ AUDIT (approved knowledge)
- *     • Rewrites one script-owned tab in the Audit workbook, BIRDIE SYNC,
- *       with the current Brand rules, Video editing rules and anything
- *       marked Approved in APPROVAL QUEUE / AI RECOMMENDATIONS.
- *     • Approved AI RECOMMENDATIONS are added once to Audit › CREATIVE
- *       TESTS as a "Planned" row (ID = AUTO-xxxxxxxx) so they show up in
- *       the test log.
+ *     • Rebuilds one script-owned Audit tab, BIRDIE SYNC.
+ *     • AI RECOMMENDATIONS whose Review status is exactly "Approved" are added
+ *       once to Audit › CREATIVE TESTS as "Planned" rows.
  *
- *   REFERENCE DOCS (read-only)
- *     • October Playbook and November Reset are read and fingerprinted only.
- *       If either changes, a RESEARCH QUEUE item asks for a human review of
- *       the rules sourced from it. The Docs are never written to.
+ *   REFERENCE DOCS: read-only fingerprints. A change opens a review item.
  *
- * No AI or paid API calls are made. AI analysis mode stays OFF.
+ * RELIABILITY
+ *     • Two-phase run: changes are DETECTED first, and fingerprints are only
+ *       COMMITTED after every step succeeds. A failed run leaves the work
+ *       pending, and the next run redoes it.
+ *     • Every write is idempotent (keyed by a stable ID), so a retry never
+ *       creates duplicates.
+ *     • Header check: if a tab is missing a column the script needs, that
+ *       tab is skipped, reported as a warning, and left pending (never
+ *       reported as synced).
+ *     • Script-owned tabs (BIRDIE SYNC, AUDIT KNOWLEDGE) are only rebuilt
+ *       when cell A1 carries the script's marker.
+ *
+ * No AI, external API or paid service is used. AI analysis mode stays OFF.
  */
 
 // ───────────────────────────── Configuration ─────────────────────────────
@@ -45,8 +51,10 @@ var CONFIG = {
     novDoc: '1oYltsAM8yQcpzPY1tFSVl7zPgkQGtVvy93Oz9WwFxTE'
   },
 
-  // Daily trigger hour, in the Apps Script project's time zone.
-  DAILY_HOUR: 6,
+  // Daily sync: ~8:00 a.m. Eastern (runs between 8:00 and 9:00).
+  // The trigger is pinned to this zone, whatever the project's time zone.
+  TIMEZONE: 'America/New_York',
+  DAILY_HOUR: 8,
 
   // Audit tabs that are fingerprinted for changes.
   AUDIT_TABS_WATCHED: [
@@ -78,17 +86,19 @@ var CONFIG = {
     'YAPPING 10-DAY PLAN': ['Short-term talking-video plan', 'While the 10-day plan is running']
   },
 
-  // Script-owned tab created in the Audit workbook. Never watched.
-  MIRROR_TAB: 'BIRDIE SYNC',
+  // SHOP KPI BASELINE rows whose Scope is one of these (and whose
+  // "Period / date" is a date range with at least one recorded KPI) count as
+  // reporting periods. Audience, PPS, listing and brand-brief rows are ignored.
+  SHOP_PERIOD_SCOPES: ['TikTok Shop affiliate'],
 
-  // Script-owned tab created in Birdie Brain.
-  KNOWLEDGE_MIRROR_TAB: 'AUDIT KNOWLEDGE',
+  // Script-owned tabs.
+  MIRROR_TAB: 'BIRDIE SYNC',               // in the Audit workbook
+  KNOWLEDGE_MIRROR_TAB: 'AUDIT KNOWLEDGE', // in Birdie Brain
 
   THRESHOLDS: {
-    minViewsForRate: 1000,     // don't judge follow rate below this many views
-    followsPer1kLow: 1.0,      // flag follow conversion below this
+    minViewsForRate: 1000,      // don't judge follow rate below this many views
+    followsPer1kLow: 1.0,       // flag follow conversion below this
     threeSecRetentionLow: 0.70, // flag 3-sec retention below 70%
-    // Audience fit (Gen X midlife women, US). Flagged when a reading falls below.
     audienceFemaleMin: 0.70,
     audience45PlusMin: 0.60,
     audienceUsMin: 0.80
@@ -110,8 +120,41 @@ var BRAIN = {
   BRIEFING: 'TODAY BRIEFING'
 };
 
+// Exact column names the script reads or writes. Checked on every run.
+var REQUIRED_HEADERS = {
+  brain: {
+    'AI CONTROL CENTER': ['Key', 'Value', 'Status'],
+    'BRAND RULES': ['Rule ID'],
+    'SOURCE INDEX': ['Source ID', 'Type', 'Name', 'URL', 'Data authority', 'Read when'],
+    'SYNC SNAPSHOTS': ['Synced at UTC', 'Source sheet', 'Row count', 'Digest SHA256', 'Latest sample / health', 'Notes'],
+    'AI RECOMMENDATIONS': ['Created UTC', 'Proposal ID', 'Problem or observation', 'Recommended experiment', 'Evidence level', 'Source references', 'Success metric', 'Review status', 'Decision / notes'],
+    'APPROVAL QUEUE': ['Created UTC', 'Proposal ID', 'Proposed change', 'Source / reasoning', 'Status', 'Reviewed by', 'Reviewed at', 'Notes'],
+    'CHANGE LOG': ['Timestamp UTC', 'Operation', 'Target', 'Detail', 'Outcome', 'Error'],
+    'VIDEO EDITING RULES': ['Rule ID', 'Task', 'Workflow', 'Evidence required', 'Avoid'],
+    'RESEARCH QUEUE': ['Submitted UTC', 'Claim / source', 'Link', 'Reviewed date', 'Evidence class', 'Implications', 'Status', 'Notes']
+  },
+  audit: {
+    'POST LOG': ['ID', 'Posted date', 'Time', 'Topic', 'Job', 'Views', 'Follows'],
+    'SNAPSHOTS': ['ID', 'Date', 'Time', 'Hours after post', 'Views', 'Follows'],
+    'AUDIENCE': ['ID', 'Snapshot', 'Female', '45–54', '55+', '45+ total', 'USA', 'Non-followers'],
+    'RETENTION': ['ID', 'Snapshot', '3-sec retention', 'Largest drop'],
+    'CREATIVE TESTS': ['Test', 'Date', 'Hypothesis', 'Primary measure', 'Benchmark', 'Result', 'Decision', 'Next action'],
+    'SHOP CREATIVE TESTS': ['ID', 'Category', 'Evidence / claim', 'Status'],
+    'SHOP KPI BASELINE': ['Period / date', 'Scope', 'GMV USD', 'Attributed items', 'Product clicks', 'Est. commission USD', 'Product card CTR', 'Evidence label'],
+    'WEEKLY REVIEW': ['Window', 'Views', 'Profile views', 'Shares', 'Estimated rewards', 'FYP', 'Search', 'Lesson / next decision'],
+    'INSPIRATION BANK': ['ID', 'Theme / territory', 'Why it caught attention', 'Hook / psychology', 'Audience mirror', 'Original Becky direction (idea only)', 'Content pillar', 'Source attribution', 'Status'],
+    'CREATOR TRAINING LAB': ['ID', 'Category', 'Rule / learning', 'Observed evidence', 'Becky application', 'Execution standard', 'Test / measurement', 'Status', 'Source / reference'],
+    'VISUAL STYLE GUIDE': ['Style ID', 'Style element', 'Color name', 'Approx. HEX', 'Source image', 'Visual treatment', 'Best use', 'Contrast / readability', 'Brand guidance', 'Status']
+  }
+};
+
 var AUTO_PREFIX = 'Auto · ';
 var PUSHED_NEXT_ACTION = 'Record result here; it syncs back to Birdie Brain';
+var MIRROR_MARKER = 'BIRDIE SYNC — written by the Birdie Brain Apps Script';
+var KNOWLEDGE_MARKER = 'AUDIT KNOWLEDGE — copied from the Audit workbook by the Birdie Brain Apps Script';
+var NOT_RECORDED = 'not recorded';
+// Review statuses that mean "decided" (anything else counts as waiting for review).
+var DECIDED_STATUS = /^(approved|rejected|testing|tested|done|complete|completed|closed|archived)\b/i;
 
 // ───────────────────────────── Entry points ──────────────────────────────
 
@@ -120,13 +163,13 @@ function onOpen() {
     .createMenu('Birdie Sync')
     .addItem('Run sync now', 'refreshBirdieBrain')
     .addItem('Install / repair daily trigger', 'installBirdieTrigger')
-    .addItem('Turn off automatic sync', 'removeBirdieTriggers')
+    .addItem('Turn off automatic sync', 'turnOffBirdieSync')
     .addToUi();
 }
 
 /**
- * Main job. Run once by hand to authorize. That first run also installs
- * the daily trigger if there isn't one yet.
+ * Main job. Run once by hand to authorize; that first run also installs the
+ * daily trigger (exactly one) if it is missing or out of date.
  */
 function refreshBirdieBrain() {
   var lock = LockService.getScriptLock();
@@ -145,30 +188,40 @@ function refreshBirdieBrain() {
       now: nowUtc_(),
       today: Utilities.formatDate(new Date(), 'UTC', 'yyyy-MM-dd'),
       props: PropertiesService.getScriptProperties(),
+      pendingProps: {},      // committed only after every step succeeds
+      pendingSnapRows: [],   // SYNC SNAPSHOTS rows, written at commit
+      warnings: [],
+      blockedTabs: {},       // tab -> missing headers (skipped, left pending)
+      dataNotes: [],
       stats: { changedTabs: [], recs: 0, research: 0, pushedTests: 0, resultsBack: 0, docsChanged: [],
                proposals: 0, rulesAdded: 0, knowledgeMirrored: false }
     };
 
-    // Audit ➜ Brain
+    checkHeaders_(ctx);
+
+    // Phase 1: detect (nothing is marked as processed yet).
     ctx.stats.changedTabs = snapshotAuditTabs_(ctx);
     ctx.docs = snapshotReferenceDocs_(ctx);
+
+    // Phase 2: process. Every write below is idempotent.
     if (ctx.stats.changedTabs.length) runAuditRules_(ctx);
     syncTestResultsBack_(ctx);
     mirrorAuditKnowledge_(ctx);
     proposeNewKnowledge_(ctx);
     promoteApprovedKnowledge_(ctx);
     indexReferenceTabs_(ctx);
-
-    // Brain ➜ Audit
     pushApprovedToAudit_(ctx);
-
     updateBriefing_(ctx);
+
+    // Phase 3: commit.
+    commitSync_(ctx);
     ensureTrigger_();
 
-    setControl_(brain, 'System status', 'ACTIVE', 'Sync running');
-    setControl_(brain, 'Refresh frequency', null, 'Active');
-    setControl_(brain, 'Last refresh UTC', ctx.now, 'OK');
-    setControl_(brain, 'Last error', '', 'None');
+    var hasWarnings = ctx.warnings.length > 0;
+    setControl_(brain, 'System status', hasWarnings ? 'ACTIVE — WARNINGS' : 'ACTIVE',
+      hasWarnings ? 'See CHANGE LOG: ' + ctx.warnings.length + ' warning(s)' : 'Sync running');
+    setControl_(brain, 'Last refresh UTC', ctx.now, hasWarnings ? 'OK with warnings' : 'OK');
+    clearLastError_(brain, ctx.now);
 
     var s = ctx.stats;
     logChange_(brain, 'refresh', 'Audit ⇄ Brain',
@@ -178,13 +231,15 @@ function refreshBirdieBrain() {
       ' | tests pushed: ' + s.pushedTests + ' | results synced back: ' + s.resultsBack +
       ' | knowledge proposals: ' + s.proposals + ' | rules added: ' + s.rulesAdded +
       ' | AUDIT KNOWLEDGE ' + (s.knowledgeMirrored ? 'refreshed' : 'unchanged'),
-      'OK', '');
+      hasWarnings ? 'OK WITH WARNINGS' : 'OK', ctx.warnings.join(' || ').slice(0, 2000));
   } catch (err) {
     var msg = String(err && err.stack ? err.stack : err);
+    var pending = ctx && ctx.stats && ctx.stats.changedTabs.length
+      ? ' Pending (will be redone next run): ' + ctx.stats.changedTabs.join(', ') + '.' : '';
     try {
-      setControl_(brain, 'Last error', nowUtc_() + ' — ' + String(err), 'Error');
-      setControl_(brain, 'System status', 'ERROR', 'See Last error / CHANGE LOG');
-      logChange_(brain, 'refresh', 'Audit ⇄ Brain', 'Sync failed', 'FAILED', msg.slice(0, 1000));
+      setControl_(brain, 'Last error', nowUtc_() + ' — ' + String(err) + pending, 'Error — see CHANGE LOG');
+      setControl_(brain, 'System status', 'ERROR', 'Last sync failed; nothing was marked as processed');
+      logChange_(brain, 'refresh', 'Audit ⇄ Brain', 'Sync failed. Nothing committed.' + pending, 'FAILED', msg.slice(0, 2000));
     } catch (ignored) {}
     throw err;
   } finally {
@@ -192,42 +247,90 @@ function refreshBirdieBrain() {
   }
 }
 
+/** Installs exactly one daily trigger for refreshBirdieBrain (~8 a.m. Eastern). */
 function installBirdieTrigger() {
-  removeBirdieTriggers(true);
+  deleteSyncTriggers_();
   ScriptApp.newTrigger('refreshBirdieBrain')
-    .timeBased().everyDays(1).atHour(CONFIG.DAILY_HOUR).create();
+    .timeBased().everyDays(1).atHour(CONFIG.DAILY_HOUR).inTimezone(CONFIG.TIMEZONE).create();
+  PropertiesService.getScriptProperties().setProperty('trigger:spec', triggerSpec_());
   var brain = getBrain_();
-  setControl_(brain, 'Refresh frequency', 'Daily (~' + CONFIG.DAILY_HOUR + ':00 script time)', 'Active');
-  logChange_(brain, 'trigger', 'refreshBirdieBrain', 'Daily trigger installed', 'OK', '');
+  setControl_(brain, 'Refresh frequency', 'Daily ~' + CONFIG.DAILY_HOUR + ':00 a.m. Eastern (' + CONFIG.TIMEZONE + ')', 'Active');
+  logChange_(brain, 'trigger', 'refreshBirdieBrain', 'Daily trigger installed: ' + triggerSpec_(), 'OK', '');
 }
 
-function removeBirdieTriggers(silent) {
-  ScriptApp.getProjectTriggers().forEach(function (t) {
-    if (t.getHandlerFunction() === 'refreshBirdieBrain') ScriptApp.deleteTrigger(t);
-  });
-  if (silent === true) return;
+/** Menu: turn off automatic sync. Removes only this script's sync trigger. */
+function turnOffBirdieSync() {
+  var removed = deleteSyncTriggers_();
+  PropertiesService.getScriptProperties().deleteProperty('trigger:spec');
   var brain = getBrain_();
-  setControl_(brain, 'Refresh frequency', null, 'Not active');
+  setControl_(brain, 'Refresh frequency', 'Off (manual: Birdie Sync › Run sync now)', 'Not active');
   setControl_(brain, 'System status', 'PAUSED', 'Automatic sync turned off');
-  logChange_(brain, 'trigger', 'refreshBirdieBrain', 'Daily trigger removed', 'OK', '');
+  logChange_(brain, 'trigger', 'refreshBirdieBrain', 'Automatic sync turned off; removed ' + removed + ' trigger(s)', 'OK', '');
 }
 
-function ensureTrigger_() {
-  var has = ScriptApp.getProjectTriggers().some(function (t) {
-    return t.getHandlerFunction() === 'refreshBirdieBrain';
+/** Kept for compatibility with the first version's menu. */
+function removeBirdieTriggers() { turnOffBirdieSync(); }
+
+function deleteSyncTriggers_() {
+  var n = 0;
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'refreshBirdieBrain') { ScriptApp.deleteTrigger(t); n++; }
   });
-  if (!has) installBirdieTrigger();
+  return n;
 }
 
-// ───────────────────────────── Audit ➜ Brain ─────────────────────────────
+function triggerSpec_() { return 'daily@' + CONFIG.DAILY_HOUR + ':00 ' + CONFIG.TIMEZONE; }
 
-/** Fingerprint watched Audit tabs and return the names of the ones that changed. */
+/** Reinstalls the trigger when there isn't exactly one or its schedule is out of date. */
+function ensureTrigger_() {
+  var count = ScriptApp.getProjectTriggers().filter(function (t) {
+    return t.getHandlerFunction() === 'refreshBirdieBrain';
+  }).length;
+  var spec = PropertiesService.getScriptProperties().getProperty('trigger:spec');
+  if (count !== 1 || spec !== triggerSpec_()) installBirdieTrigger();
+}
+
+// ───────────────────────────── Header check ──────────────────────────────
+
+function checkHeaders_(ctx) {
+  // Birdie Brain: the script writes here, so a missing column stops the run.
+  var brainProblems = [];
+  Object.keys(REQUIRED_HEADERS.brain).forEach(function (tab) {
+    var sh = ctx.brain.getSheetByName(tab);
+    if (!sh) { brainProblems.push(tab + ' (tab missing)'); return; }
+    var missing = missingHeaders_(readTable_(sh).headers, REQUIRED_HEADERS.brain[tab]);
+    if (missing.length) brainProblems.push(tab + ': ' + missing.join(', '));
+  });
+  if (brainProblems.length) {
+    throw new Error('Birdie Brain is missing required columns, so nothing was written. ' + brainProblems.join(' | '));
+  }
+  // Audit: a tab with a missing column is skipped and left pending.
+  Object.keys(REQUIRED_HEADERS.audit).forEach(function (tab) {
+    var sh = ctx.audit.getSheetByName(tab);
+    var missing = sh ? missingHeaders_(readTable_(sh).headers, REQUIRED_HEADERS.audit[tab]) : ['(tab missing)'];
+    if (missing.length) {
+      ctx.blockedTabs[tab] = missing;
+      warn_(ctx, 'Audit › ' + tab + ' skipped: missing column(s) ' + missing.join(', ') + '. Not marked as synced.');
+    }
+  });
+}
+
+function missingHeaders_(have, need) {
+  return need.filter(function (h) { return have.indexOf(h) === -1; });
+}
+
+function usable_(ctx, tab) { return !ctx.blockedTabs[tab] && !!ctx.audit.getSheetByName(tab); }
+
+function warn_(ctx, msg) { ctx.warnings.push(msg); }
+
+// ───────────────────────────── Detect & commit ───────────────────────────
+
+/** Phase 1: fingerprint watched Audit tabs. Returns changed tab names. Writes nothing. */
 function snapshotAuditTabs_(ctx) {
   var changed = [];
-  var snapSheet = mustSheet_(ctx.brain, BRAIN.SNAPSHOTS);
   CONFIG.AUDIT_TABS_WATCHED.forEach(function (name) {
     var sh = ctx.audit.getSheetByName(name);
-    if (!sh) return;
+    if (!sh || ctx.blockedTabs[name]) return;
     var values = sh.getDataRange().getDisplayValues();
     var digest = sha256_(JSON.stringify(values));
     var key = 'digest:audit:' + name;
@@ -238,12 +341,20 @@ function snapshotAuditTabs_(ctx) {
     var last = table.rows.length ? table.rows[table.rows.length - 1] : null;
     var sample = last ? table.headers.slice(0, 4).map(function (h) { return last[h]; })
       .filter(String).join(' | ') : '(no data rows)';
-    snapSheet.appendRow([ctx.now, 'Audit › ' + name, table.rows.length, digest, sample.slice(0, 300),
+    ctx.pendingProps[key] = digest;
+    ctx.pendingSnapRows.push([ctx.now, 'Audit › ' + name, table.rows.length, digest, sample.slice(0, 300),
       prev ? 'Changed since last sync' : 'Baseline (first sync)']);
-    ctx.props.setProperty(key, digest);
     changed.push(name);
   });
   return changed;
+}
+
+/** Phase 3: record SYNC SNAPSHOTS rows and fingerprints only after everything succeeded. */
+function commitSync_(ctx) {
+  var snap = mustSheet_(ctx.brain, BRAIN.SNAPSHOTS);
+  ctx.pendingSnapRows.forEach(function (r) { snap.appendRow(r); });
+  ctx.pendingProps['sync:lastCommit'] = ctx.now;
+  ctx.props.setProperties(ctx.pendingProps);
 }
 
 /** Read-only fingerprint of both reference Docs. Never writes to them. */
@@ -252,8 +363,8 @@ function snapshotReferenceDocs_(ctx) {
     { id: ctx.ids.octDoc, label: 'October Creator Marketing Master Playbook' },
     { id: ctx.ids.novDoc, label: 'November TikTok Master Reset' }
   ];
-  var snapSheet = mustSheet_(ctx.brain, BRAIN.SNAPSHOTS);
   var research = mustSheet_(ctx.brain, BRAIN.RESEARCH);
+  var notesText = readTable_(research).rows.map(function (r) { return r['Notes'] || ''; }).join('\n');
   var out = [];
   docs.forEach(function (d) {
     if (!d.id) return;
@@ -268,21 +379,28 @@ function snapshotReferenceDocs_(ctx) {
       var key = 'digest:doc:' + d.id;
       var prev = ctx.props.getProperty(key);
       if (prev !== digest) {
-        snapSheet.appendRow([ctx.now, 'Doc › ' + d.label, info.words + ' words', digest,
+        ctx.pendingSnapRows.push([ctx.now, 'Doc › ' + d.label, info.words + ' words', digest,
           'Last edited ' + info.updated, prev ? 'Reference changed — review only' : 'Baseline (first sync)']);
         if (prev) {
-          research.appendRow([ctx.now,
-            'Reference doc updated: ' + d.label + '. Check whether BRAND RULES / VIDEO EDITING RULES that cite it need revising. Nothing was changed automatically.',
-            info.url, '', 'BRAND BRIEF', 'Rules sourced from this doc may now be out of date', 'Pending review',
-            'Doc last edited ' + info.updated]);
-          ctx.stats.research++;
+          var tag = 'sync-key:' + sha256_('doc|' + d.id + '|' + digest).slice(0, 10);
+          if (notesText.indexOf(tag) === -1) {
+            appendByHeaders_(research, {
+              'Submitted UTC': ctx.now,
+              'Claim / source': 'Reference doc updated: ' + d.label + '. Check whether BRAND RULES / VIDEO EDITING RULES that cite it need revising. Nothing was changed automatically.',
+              'Link': info.url, 'Reviewed date': '', 'Evidence class': 'BRAND BRIEF',
+              'Implications': 'Rules sourced from this doc may now be out of date', 'Status': 'Pending review',
+              'Notes': 'Doc last edited ' + info.updated + ' ' + tag
+            });
+            notesText += '\n' + tag;
+            ctx.stats.research++;
+          }
           ctx.stats.docsChanged.push(d.label);
         }
-        ctx.props.setProperty(key, digest);
+        ctx.pendingProps[key] = digest;
       }
     } catch (e) {
       info.error = String(e);
-      logChange_(ctx.brain, 'read-doc', d.label, 'Could not read reference doc', 'WARNING', String(e));
+      warn_(ctx, 'Could not read reference doc ' + d.label + ': ' + String(e));
     }
     out.push(info);
   });
@@ -308,28 +426,23 @@ function readDocText_(id) {
   return doc.getBody().getText();
 }
 
+// ───────────────────────────── Audit ➜ Brain ─────────────────────────────
+
 /** Rule-based observations. Every result waits for review; nothing becomes a rule automatically. */
 function runAuditRules_(ctx) {
   var T = CONFIG.THRESHOLDS;
   var recSheet = mustSheet_(ctx.brain, BRAIN.RECS);
-  var recTable = readTable_(recSheet);
   var existing = {};
-  recTable.rows.forEach(function (r) { if (r['Proposal ID']) existing[r['Proposal ID']] = true; });
+  readTable_(recSheet).rows.forEach(function (r) { if (r['Proposal ID']) existing[r['Proposal ID']] = true; });
 
   function addRec(ruleKey, problem, experiment, evidence, sources, metric) {
     var id = 'AUTO-' + sha256_(ruleKey).slice(0, 8);
     if (existing[id]) return;
     existing[id] = true;
     appendByHeaders_(recSheet, {
-      'Created UTC': ctx.now,
-      'Proposal ID': id,
-      'Problem or observation': problem,
-      'Recommended experiment': experiment,
-      'Evidence level': evidence,
-      'Source references': sources,
-      'Success metric': metric,
-      'Review status': 'Pending review',
-      'Decision / notes': ''
+      'Created UTC': ctx.now, 'Proposal ID': id, 'Problem or observation': problem,
+      'Recommended experiment': experiment, 'Evidence level': evidence, 'Source references': sources,
+      'Success metric': metric, 'Review status': 'Pending review', 'Decision / notes': ''
     });
     ctx.stats.recs++;
   }
@@ -337,15 +450,17 @@ function runAuditRules_(ctx) {
   var changed = {};
   ctx.stats.changedTabs.forEach(function (n) { changed[n] = true; });
 
-  // Follow conversion: latest SNAPSHOT per post (official source); POST LOG fills in when a post has no snapshot.
-  if (changed['SNAPSHOTS'] || changed['POST LOG']) {
-    var latest = latestReadings_(ctx.audit);
+  // Follow conversion: latest dated SNAPSHOT per post (official source). POST LOG
+  // fills in only for logged posts (with a Posted date). Historical grid rows
+  // (no posted date) are never judged: their follows can't be recorded.
+  if ((changed['SNAPSHOTS'] || changed['POST LOG']) && usable_(ctx, 'SNAPSHOTS') && usable_(ctx, 'POST LOG')) {
+    var latest = latestReadings_(ctx);
     Object.keys(latest).forEach(function (pid) {
       var r = latest[pid];
       if (r.views === null || r.views < T.minViewsForRate) return;
       if (r.follows === null) {
         addRec('missing-follows|' + pid,
-          pid + ' has ' + fmtInt_(r.views) + ' views (' + r.where + ') but no Follows recorded (PENDING).',
+          pid + ' has ' + fmtInt_(r.views) + ' views (' + r.where + (r.when ? ', ' + r.when : '') + ') but no Follows recorded (PENDING).',
           'Record follows, plus profile visits if TikTok Studio shows them, for ' + pid + ' at a dated reading so follow conversion can be judged (BR-09).',
           'PENDING', 'Audit › ' + r.where + '; BR-09', 'Follows / 1K views recorded');
         return;
@@ -357,26 +472,26 @@ function runAuditRules_(ctx) {
           ' views (' + r.where + (r.when ? ', ' + r.when : '') + '). Below the ' + T.followsPer1kLow.toFixed(1) + ' follows/1K threshold (OBSERVED).',
           'On the next post with the same job, test one change aimed at following (e.g. a profile-directed CTA or the BR-13 bio test). Compare follows/1K at a similar number of hours after posting.',
           'HYPOTHESIS', 'Audit › ' + r.where + '; START HERE follow-rate definition; BR-09; BR-13',
-          'Follows / 1K views above ' + T.followsPer1kLow + ' at a comparable reading');
+          'Follows / 1K views above ' + T.followsPer1kLow.toFixed(1) + ' at a comparable reading');
       }
     });
   }
 
   // Hook retention.
-  if (changed['RETENTION']) {
+  if (changed['RETENTION'] && usable_(ctx, 'RETENTION')) {
     readTable_(ctx.audit.getSheetByName('RETENTION')).rows.forEach(function (r) {
       var pid = r['ID']; var ret = parsePct_(r['3-sec retention']);
       if (!pid || ret === null || ret >= T.threeSecRetentionLow) return;
       addRec('low-3s-retention|' + pid,
-        pid + ' kept ' + Math.round(ret * 100) + '% of viewers at 3 seconds (snapshot ' + (r['Snapshot'] || '?') +
-        '; largest drop ' + (r['Largest drop'] || '?') + ') (OBSERVED).',
+        pid + ' kept ' + pct_(ret) + ' of viewers at 3 seconds (snapshot ' + (r['Snapshot'] || NOT_RECORDED) +
+        '; largest drop ' + (r['Largest drop'] || NOT_RECORDED) + ') (OBSERVED).',
         'Recut the first 2–3 seconds with a specific recognition hook and a visual that works without sound (ED-02). Keep the rest the same.',
-        'HYPOTHESIS', 'Audit › RETENTION; ED-02; BR-06', '3-sec retention ≥ ' + Math.round(T.threeSecRetentionLow * 100) + '%');
+        'HYPOTHESIS', 'Audit › RETENTION; ED-02; BR-06', '3-sec retention ≥ ' + pct_(T.threeSecRetentionLow));
     });
   }
 
   // Audience fit.
-  if (changed['AUDIENCE']) {
+  if (changed['AUDIENCE'] && usable_(ctx, 'AUDIENCE')) {
     readTable_(ctx.audit.getSheetByName('AUDIENCE')).rows.forEach(function (r) {
       var pid = r['ID']; if (!pid) return;
       var a = audienceOf_(r);
@@ -386,7 +501,7 @@ function runAuditRules_(ctx) {
       if (a.us !== null && a.us < T.audienceUsMin) misses.push('US ' + pct_(a.us) + ' (target ≥ ' + pct_(T.audienceUsMin) + ')');
       if (!misses.length) return;
       addRec('audience-drift|' + pid + '|' + (r['Snapshot'] || ''),
-        pid + ' audience at ' + (r['Snapshot'] || '?') + ' is off target: ' + misses.join('; ') + ' (OBSERVED).',
+        pid + ' audience at ' + (r['Snapshot'] || NOT_RECORDED) + ' is off target: ' + misses.join('; ') + ' (OBSERVED).',
         'Check whether the hook, sound or topic pulled a different crowd. Next comparable post: open on a scene specific to Gen X midlife women (BR-04) and compare audience mix at a similar reading.',
         'HYPOTHESIS', 'Audit › AUDIENCE; MIRROR & FUNNELS › AUDIENCE; BR-01; BR-04',
         'Female ≥ ' + pct_(T.audienceFemaleMin) + ', 45+ ≥ ' + pct_(T.audience45PlusMin) + ', US ≥ ' + pct_(T.audienceUsMin));
@@ -408,17 +523,17 @@ function runAuditRules_(ctx) {
   }
   var auditUrl = 'https://docs.google.com/spreadsheets/d/' + ctx.ids.audit + '/edit';
 
-  if (changed['CREATIVE TESTS']) {
+  if (changed['CREATIVE TESTS'] && usable_(ctx, 'CREATIVE TESTS')) {
     readTable_(ctx.audit.getSheetByName('CREATIVE TESTS')).rows.forEach(function (r) {
       var id = r['Test']; var result = (r['Result'] || '').trim();
       if (!id || !result || /^pending$/i.test(result)) return;
       addResearch('creative-test|' + id + '|' + result,
         'Creative test ' + id + ' result: ' + result + (r['Decision'] ? ' — decision: ' + r['Decision'] : '') +
-        '. Hypothesis: ' + (r['Hypothesis'] || '?'),
+        '. Hypothesis: ' + (r['Hypothesis'] || NOT_RECORDED),
         auditUrl, 'Decide whether this stays a single result or becomes a rule (BR-11: don\'t promote a hypothesis on its own).');
     });
   }
-  if (changed['SHOP CREATIVE TESTS']) {
+  if (changed['SHOP CREATIVE TESTS'] && usable_(ctx, 'SHOP CREATIVE TESTS')) {
     readTable_(ctx.audit.getSheetByName('SHOP CREATIVE TESTS')).rows.forEach(function (r) {
       var id = r['ID']; var status = (r['Status'] || '').trim();
       if (!id || !/(complete|done|result|won|lost|winner|confirmed)/i.test(status)) return;
@@ -429,37 +544,71 @@ function runAuditRules_(ctx) {
   }
 }
 
-/** Latest reading per post: SNAPSHOTS first (source of truth), POST LOG fills in missing posts. */
-function latestReadings_(audit) {
+/**
+ * Latest reading per post, chosen by actual date/time, not row position.
+ *   1. SNAPSHOTS (source of truth). Timestamp = Date + Time; if missing, Posted
+ *      date/time + "Hours after post". Rows with a timestamp beat rows without.
+ *      Exact duplicate timestamps: the lower row wins (treated as a correction).
+ *   2. POST LOG fills in only for logged posts (Posted date present).
+ * Data issues (missing timestamps, duplicates) are noted in ctx.dataNotes.
+ */
+function latestReadings_(ctx) {
+  if (ctx._latest) return ctx._latest;
+  var audit = ctx.audit;
   var out = {};
+  var posted = {};
+  var log = audit.getSheetByName('POST LOG');
+  var logRows = log ? readTable_(log).rows : [];
+  logRows.forEach(function (r) {
+    if (r['ID'] && r['Posted date']) posted[r['ID']] = parseDateTime_(r['Posted date'], r['Time']);
+  });
+
   var snaps = audit.getSheetByName('SNAPSHOTS');
+  var noTs = 0, dupes = 0, seen = {};
   if (snaps) {
     readTable_(snaps).rows.forEach(function (r) {
       var pid = r['ID']; if (!pid) return;
       var hours = parseNum_(r['Hours after post']);
+      var ts = parseDateTime_(r['Date'], r['Time']);
+      if (ts === null && hours !== null && posted[pid] != null) ts = posted[pid] + hours * 3600 * 1000;
+      if (ts === null) noTs++;
+      var dupKey = pid + '|' + ts;
+      if (ts !== null && seen[dupKey]) dupes++;
+      seen[dupKey] = true;
+      var cand = { views: parseNum_(r['Views']), follows: parseNum_(r['Follows']), hours: hours, ts: ts,
+        where: 'SNAPSHOTS', when: [r['Date'], r['Time']].filter(String).join(' ') || (hours !== null ? hours + ' h after post' : '') };
       var prev = out[pid];
-      if (prev && hours !== null && prev.hours !== null && hours < prev.hours) return;
-      out[pid] = { views: parseNum_(r['Views']), follows: parseNum_(r['Follows']), hours: hours,
-        where: 'SNAPSHOTS', when: [r['Date'], r['Time']].filter(String).join(' ') };
+      if (!prev || newerReading_(cand, prev)) out[pid] = cand;
     });
   }
-  var log = audit.getSheetByName('POST LOG');
-  if (log) {
-    readTable_(log).rows.forEach(function (r) {
-      var pid = r['ID']; if (!pid || out[pid]) return;
-      out[pid] = { views: parseNum_(r['Views']), follows: parseNum_(r['Follows']), hours: null,
-        where: 'POST LOG', when: r['Posted date'] || '' };
-    });
-  }
+  if (noTs) ctx.dataNotes.push(noTs + ' SNAPSHOTS row(s) without a usable date/time');
+  if (dupes) ctx.dataNotes.push(dupes + ' duplicate SNAPSHOTS timestamp(s); the lower row was used');
+
+  logRows.forEach(function (r) {
+    var pid = r['ID']; if (!pid || !r['Posted date'] || out[pid]) return;
+    out[pid] = { views: parseNum_(r['Views']), follows: parseNum_(r['Follows']), hours: null, ts: null,
+      where: 'POST LOG', when: r['Posted date'] };
+  });
+  ctx._latest = out;
   return out;
+}
+
+/** true if reading a is newer than b. Equal = later row wins (a comes later). */
+function newerReading_(a, b) {
+  if (a.ts !== null && b.ts !== null) return a.ts >= b.ts;
+  if (a.ts !== null) return true;
+  if (b.ts !== null) return false;
+  if (a.hours !== null && b.hours !== null) return a.hours >= b.hours;
+  if (a.hours !== null) return true;
+  if (b.hours !== null) return false;
+  return true;
 }
 
 /** Copy results Becky entered in Audit › CREATIVE TESTS for AUTO- experiments back into AI RECOMMENDATIONS. */
 function syncTestResultsBack_(ctx) {
-  var tests = ctx.audit.getSheetByName('CREATIVE TESTS');
-  if (!tests) return;
+  if (!usable_(ctx, 'CREATIVE TESTS')) return;
   var results = {};
-  readTable_(tests).rows.forEach(function (r) {
+  readTable_(ctx.audit.getSheetByName('CREATIVE TESTS')).rows.forEach(function (r) {
     var id = r['Test'] || '';
     var res = (r['Result'] || '').trim();
     if (id.indexOf('AUTO-') === 0 && res && !/^pending$/i.test(res)) {
@@ -472,7 +621,6 @@ function syncTestResultsBack_(ctx) {
   var recSheet = mustSheet_(ctx.brain, BRAIN.RECS);
   var t = readTable_(recSheet);
   var notesCol = t.headers.indexOf('Decision / notes');
-  if (notesCol === -1) return;
   t.rows.forEach(function (r) {
     var line = results[r['Proposal ID']];
     if (!line) return;
@@ -500,26 +648,30 @@ function mirrorAuditKnowledge_(ctx) {
   var target = ctx.brain.getSheetByName(CONFIG.KNOWLEDGE_MIRROR_TAB);
   var changed = ctx.stats.changedTabs.some(function (n) { return CONFIG.KNOWLEDGE_TABS.indexOf(n) !== -1; });
   if (target && !changed) return;
+  if (target && !ownedSheet_(target, KNOWLEDGE_MARKER)) {
+    warn_(ctx, 'Brain › ' + CONFIG.KNOWLEDGE_MIRROR_TAB + ' exists but was not created by this script (A1 has no script marker). Left untouched; rename that tab to let the script create its own.');
+    return;
+  }
 
-  var rows = [['AUDIT KNOWLEDGE — copied from the Audit workbook by the Birdie Brain Apps Script. Don\'t edit here: this tab is overwritten whenever a source tab changes. Edit the Audit workbook instead.',
+  var rows = [[KNOWLEDGE_MARKER + '. Don\'t edit here: this tab is rebuilt whenever a source tab changes. Edit the Audit workbook instead.',
     'Last copied: ' + ctx.now]];
   var bands = [];
   CONFIG.KNOWLEDGE_TABS.forEach(function (name) {
     var sh = ctx.audit.getSheetByName(name);
     rows.push(['']);
-    if (!sh) { rows.push([name + ' — tab not found in Audit workbook']); return; }
+    if (!sh) { rows.push([name + ' — tab not found in Audit workbook']); warn_(ctx, 'Knowledge tab not found: ' + name); return; }
     var t = readTable_(sh);
     var cols = t.headers.filter(String);
     bands.push(rows.length + 1);
-    rows.push([name + ' (' + t.rows.length + ' rows) — ' + 'https://docs.google.com/spreadsheets/d/' + ctx.ids.audit + '/edit#gid=' + sh.getSheetId()]);
+    rows.push([name + ' (' + t.rows.length + ' rows) — https://docs.google.com/spreadsheets/d/' + ctx.ids.audit + '/edit#gid=' + sh.getSheetId()]);
     rows.push(cols);
     t.rows.forEach(function (r) { rows.push(cols.map(function (c) { return r[c] || ''; })); });
   });
-  var width = rows.reduce(function (m, r) { return Math.max(m, r.length); }, 1);
-  rows = rows.map(function (r) { while (r.length < width) r.push(''); return r; });
+  var width = padRows_(rows);
 
   target = target || ctx.brain.insertSheet(CONFIG.KNOWLEDGE_MIRROR_TAB);
   target.clear();
+  ensureSize_(target, rows.length, width);
   target.getRange(1, 1, rows.length, width).setValues(rows);
   target.setFrozenRows(1);
   target.getRange(1, 1, 1, width).setFontWeight('bold');
@@ -532,8 +684,7 @@ function mirrorAuditKnowledge_(ctx) {
 
 /** Stable identity for a knowledge row: its ID column, else a hash of its contents. */
 function knowledgeRowId_(tab, t, r) {
-  var idCol = t.headers[0];
-  var id = r[idCol];
+  var id = r[t.headers[0]];
   return id ? id : 'ROW-' + sha256_(tab + JSON.stringify(r)).slice(0, 8);
 }
 
@@ -566,52 +717,46 @@ function proposeNewKnowledge_(ctx) {
   var queued = {};
   readTable_(queue).rows.forEach(function (r) { if (r['Proposal ID']) queued[r['Proposal ID']] = true; });
   var all = ctx.props.getProperties();
-  var newProps = {};
 
   CONFIG.PROPOSE_FROM_TABS.forEach(function (tab) {
-    var sh = ctx.audit.getSheetByName(tab);
-    if (!sh) return;
+    if (!usable_(ctx, tab)) return;
     var baselineKey = 'baseline:knowledge:' + tab;
     var firstSync = !all[baselineKey];
     if (!firstSync && ctx.stats.changedTabs.indexOf(tab) === -1) return;
 
-    var t = readTable_(sh);
+    var t = readTable_(ctx.audit.getSheetByName(tab));
     t.rows.forEach(function (r) {
       var rowId = knowledgeRowId_(tab, t, r);
       var pid = 'KNOW-' + sha256_(tab + '|' + rowId).slice(0, 8);
       var seenKey = 'seen:' + pid;
       if (all[seenKey] || queued[pid]) return;
-      newProps[seenKey] = '1';
+      ctx.pendingProps[seenKey] = '1';
       if (firstSync && !CONFIG.QUEUE_EXISTING_KNOWLEDGE_ON_FIRST_SYNC) return;
       var d = describeKnowledge_(tab, r);
       appendByHeaders_(queue, {
-        'Created UTC': ctx.now,
-        'Proposal ID': pid,
-        'Proposed change': d.change,
+        'Created UTC': ctx.now, 'Proposal ID': pid, 'Proposed change': d.change,
         'Source / reasoning': 'Audit › ' + tab + ' › ' + rowId + (d.why ? ' — ' + d.why : ''),
-        'Status': 'Pending review',
-        'Reviewed by': '', 'Reviewed at': '',
-        'Notes': 'Approve to add to VIDEO EDITING RULES as ' + rowId + '. Reject to leave it in the Audit workbook only.'
+        'Status': 'Pending review', 'Reviewed by': '', 'Reviewed at': '',
+        'Notes': 'Set Status to "Approved" to add to VIDEO EDITING RULES as ' + rowId + '. "Rejected" leaves it in the Audit workbook only.'
       });
       queued[pid] = true;
       ctx.stats.proposals++;
     });
-    if (firstSync) newProps[baselineKey] = ctx.now;
+    if (firstSync) ctx.pendingProps[baselineKey] = ctx.now;
   });
-  if (Object.keys(newProps).length) ctx.props.setProperties(newProps);
 }
 
-/** Approved KNOW- proposals become VIDEO EDITING RULES rows (once each). */
+/** KNOW- proposals whose Status is exactly "Approved" become VIDEO EDITING RULES rows (once each). */
 function promoteApprovedKnowledge_(ctx) {
   var queue = readTable_(mustSheet_(ctx.brain, BRAIN.APPROVALS));
   var approved = queue.rows.filter(function (r) {
-    return /^KNOW-/.test(r['Proposal ID'] || '') && /^\s*approved/i.test(r['Status'] || '');
+    return /^KNOW-/.test(r['Proposal ID'] || '') && isApproved_(r['Status']);
   });
   if (!approved.length) return;
   var rulesSheet = mustSheet_(ctx.brain, BRAIN.EDITING);
   var rules = readTable_(rulesSheet);
   var have = {};
-  rules.rows.forEach(function (r) { have[r[rules.headers[0]]] = true; });
+  rules.rows.forEach(function (r) { have[r['Rule ID']] = true; });
   var labels = { 'INSPIRATION BANK': 'Inspiration idea', 'CREATOR TRAINING LAB': 'Creator training', 'VISUAL STYLE GUIDE': 'Visual style' };
   approved.forEach(function (r) {
     var m = String(r['Source / reasoning'] || '').match(/^Audit › (.+?) › (\S+)/);
@@ -633,8 +778,7 @@ function promoteApprovedKnowledge_(ctx) {
 
 /** List reference-only Audit tabs in SOURCE INDEX (added once each, never synced). */
 function indexReferenceTabs_(ctx) {
-  var sh = ctx.brain.getSheetByName(BRAIN.SOURCES);
-  if (!sh) return;
+  var sh = mustSheet_(ctx.brain, BRAIN.SOURCES);
   var t = readTable_(sh);
   var names = {}, maxN = 0;
   t.rows.forEach(function (r) {
@@ -669,42 +813,43 @@ function pushApprovedToAudit_(ctx) {
   var approvals = readTable_(mustSheet_(ctx.brain, BRAIN.APPROVALS));
   var recs = readTable_(mustSheet_(ctx.brain, BRAIN.RECS));
 
-  var isApproved = function (v) { return /^\s*approved/i.test(v || ''); };
-  var approvedChanges = approvals.rows.filter(function (r) { return isApproved(r['Status']); });
-  var approvedRecs = recs.rows.filter(function (r) { return isApproved(r['Review status']); });
+  var approvedChanges = approvals.rows.filter(function (r) { return isApproved_(r['Status']); });
+  var approvedRecs = recs.rows.filter(function (r) { return isApproved_(r['Review status']); });
 
-  // 1) Script-owned mirror tab.
-  var rows = [];
-  rows.push(['BIRDIE SYNC — written by the Birdie Brain Apps Script. Don\'t edit here: this tab is overwritten on every sync. Make changes in Birdie Brain.', 'Last pushed: ' + ctx.now]);
-  rows.push(['']);
-  var section = function (title, table, cols, list) {
-    rows.push([title + ' (' + list.length + ')']);
-    rows.push(cols);
-    if (!list.length) rows.push(['— none yet —']);
-    list.forEach(function (r) { rows.push(cols.map(function (c) { return r[c] || ''; })); });
-    rows.push(['']);
-  };
-  section('APPROVED BRAND RULES', brand, brand.headers.filter(String), brand.rows.filter(function (r) { return r[brand.headers[0]]; }));
-  section('APPROVED VIDEO EDITING RULES', editing, editing.headers.filter(String), editing.rows.filter(function (r) { return r[editing.headers[0]]; }));
-  section('APPROVED CHANGES (from APPROVAL QUEUE)', approvals, approvals.headers.filter(String), approvedChanges);
-  section('APPROVED EXPERIMENTS (from AI RECOMMENDATIONS)', recs, recs.headers.filter(String), approvedRecs);
+  // 1) Script-owned mirror tab (only rebuilt if the script created it).
+  var mirror = ctx.audit.getSheetByName(CONFIG.MIRROR_TAB);
+  if (mirror && !ownedSheet_(mirror, MIRROR_MARKER)) {
+    warn_(ctx, 'Audit › ' + CONFIG.MIRROR_TAB + ' exists but was not created by this script (A1 has no script marker). Left untouched; rename that tab to let the script create its own.');
+  } else {
+    var rows = [[MIRROR_MARKER + '. Don\'t edit here: this tab is rebuilt on every sync. Make changes in Birdie Brain.', 'Last pushed: ' + ctx.now], ['']];
+    var section = function (title, table, list) {
+      var cols = table.headers.filter(String);
+      rows.push([title + ' (' + list.length + ')']);
+      rows.push(cols);
+      if (!list.length) rows.push(['— none yet —']);
+      list.forEach(function (r) { rows.push(cols.map(function (c) { return r[c] || ''; })); });
+      rows.push(['']);
+    };
+    section('APPROVED BRAND RULES', brand, brand.rows.filter(function (r) { return r['Rule ID']; }));
+    section('APPROVED VIDEO EDITING RULES', editing, editing.rows.filter(function (r) { return r['Rule ID']; }));
+    section('APPROVED CHANGES (from APPROVAL QUEUE)', approvals, approvedChanges);
+    section('APPROVED EXPERIMENTS (from AI RECOMMENDATIONS)', recs, approvedRecs);
+    var width = padRows_(rows);
 
-  var width = rows.reduce(function (m, r) { return Math.max(m, r.length); }, 1);
-  rows = rows.map(function (r) { while (r.length < width) r.push(''); return r; });
+    mirror = mirror || ctx.audit.insertSheet(CONFIG.MIRROR_TAB);
+    mirror.clear();
+    ensureSize_(mirror, rows.length, width);
+    mirror.getRange(1, 1, rows.length, width).setValues(rows);
+    mirror.setFrozenRows(1);
+    rows.forEach(function (r, i) {
+      if (/^APPROVED /.test(r[0])) mirror.getRange(i + 1, 1, 1, width).setFontWeight('bold').setBackground('#FFF4D6');
+    });
+    mirror.getRange(1, 1, 1, width).setFontWeight('bold');
+  }
 
-  var mirror = ctx.audit.getSheetByName(CONFIG.MIRROR_TAB) || ctx.audit.insertSheet(CONFIG.MIRROR_TAB);
-  mirror.clear();
-  mirror.getRange(1, 1, rows.length, width).setValues(rows);
-  mirror.setFrozenRows(1);
-  rows.forEach(function (r, i) {
-    if (/^APPROVED /.test(r[0])) mirror.getRange(i + 1, 1, 1, width).setFontWeight('bold').setBackground('#FFF4D6');
-  });
-  mirror.getRange(1, 1, 1, width).setFontWeight('bold');
-
-  // 2) Approved experiments are added to the Audit test log once each.
-  if (!CONFIG.APPEND_APPROVED_TO_CREATIVE_TESTS || !approvedRecs.length) return;
+  // 2) Approved experiments are appended (never overwritten) to the Audit test log, once each.
+  if (!CONFIG.APPEND_APPROVED_TO_CREATIVE_TESTS || !approvedRecs.length || !usable_(ctx, 'CREATIVE TESTS')) return;
   var tests = ctx.audit.getSheetByName('CREATIVE TESTS');
-  if (!tests) return;
   var present = {};
   readTable_(tests).rows.forEach(function (r) { if (r['Test']) present[r['Test']] = true; });
   approvedRecs.forEach(function (r) {
@@ -727,96 +872,143 @@ function pushApprovedToAudit_(ctx) {
 
 // ───────────────────────────── Briefing ──────────────────────────────────
 
+/**
+ * Writes only rows whose column A starts with "Auto · " (columns A:B).
+ * Never touches B1 or any manually typed row. New Auto rows go below the
+ * last used row of the sheet, so they can't land on someone's notes.
+ */
 function updateBriefing_(ctx) {
   var sh = mustSheet_(ctx.brain, BRAIN.BRIEFING);
   var lines = {};
 
-  lines['Last sync (UTC)'] = ctx.now + (ctx.stats.changedTabs.length
+  var eastern = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, "yyyy-MM-dd h:mm a 'ET'");
+  lines['Last sync'] = eastern + ' (' + ctx.now + ')' + (ctx.stats.changedTabs.length
     ? ' — changed: ' + ctx.stats.changedTabs.join(', ') : ' — no Audit changes since last sync');
 
-  var log = ctx.audit.getSheetByName('POST LOG');
-  if (log) {
-    var posts = readTable_(log).rows.filter(function (r) { return r['ID'] && r['Posted date']; });
-    posts.sort(function (a, b) { return String(a['Posted date']).localeCompare(String(b['Posted date'])); });
-    var p = posts[posts.length - 1];
+  if (usable_(ctx, 'POST LOG')) {
+    var posts = readTable_(ctx.audit.getSheetByName('POST LOG')).rows.filter(function (r) { return r['ID'] && r['Posted date']; });
+    var p = latestBy_(posts, function (r) { return parseDateTime_(r['Posted date'], r['Time']); });
     if (p) lines['Latest logged post'] = p['ID'] + ' · ' + p['Posted date'] + ' · ' + (p['Topic'] || '') +
-      ' · ' + fmtInt_(parseNum_(p['Views'])) + ' views · job: ' + (p['Job'] || '?');
+      ' · ' + fmtInt_(parseNum_(p['Views'])) + ' views (POST LOG reading) · job: ' + (p['Job'] || NOT_RECORDED);
   }
 
-  var readings = latestReadings_(ctx.audit);
-  var rated = Object.keys(readings).map(function (pid) {
-    var r = readings[pid];
-    return (r.views && r.follows !== null) ? { pid: pid, rate: r.follows / r.views * 1000, r: r } : null;
-  }).filter(Boolean);
-  if (rated.length) {
-    rated.sort(function (a, b) { return b.r.views - a.r.views; });
-    lines['Follow rate (largest post)'] = rated.slice(0, 3).map(function (x) {
-      return x.pid + ' ' + x.rate.toFixed(2) + '/1K at ' + fmtInt_(x.r.views) + ' views (' + x.r.where + (x.r.when ? ' ' + x.r.when : '') + ')';
-    }).join('; ');
+  if (usable_(ctx, 'SNAPSHOTS') && usable_(ctx, 'POST LOG')) {
+    var readings = latestReadings_(ctx);
+    var rated = Object.keys(readings).map(function (pid) {
+      var r = readings[pid];
+      return (r.views && r.follows !== null) ? { pid: pid, rate: r.follows / r.views * 1000, r: r } : null;
+    }).filter(Boolean);
+    if (rated.length) {
+      rated.sort(function (a, b) { return b.r.views - a.r.views; });
+      lines['Follow rate (latest reading, largest posts)'] = rated.slice(0, 3).map(function (x) {
+        return x.pid + ' ' + x.rate.toFixed(2) + '/1K at ' + fmtInt_(x.r.views) + ' views (' + x.r.where + (x.r.when ? ' ' + x.r.when : '') + ')';
+      }).join('; ');
+    }
   }
 
-  var shop = ctx.audit.getSheetByName('SHOP KPI BASELINE');
-  if (shop) {
-    var srows = readTable_(shop).rows.filter(function (r) { return r['Period / date']; });
-    var s = srows[srows.length - 1];
-    if (s) lines['Latest Shop period'] = s['Period / date'] + ': GMV $' + (s['GMV USD'] || '?') + ', ' +
-      (s['Attributed items'] || '?') + ' items, ' + (s['Product clicks'] || '?') + ' clicks, CTR ' +
-      (s['Product card CTR'] || '?') + ', est. commission $' + (s['Est. commission USD'] || '?') + ' (' + (s['Evidence label'] || 'unlabeled') + ')';
+  if (usable_(ctx, 'SHOP KPI BASELINE')) {
+    lines['Latest TikTok Shop period'] = describeShopPeriod_(ctx);
   }
 
-  var aud = ctx.audit.getSheetByName('AUDIENCE');
-  if (aud) {
-    var arows = readTable_(aud).rows.filter(function (r) { return r['ID']; });
-    var ar = arows[arows.length - 1];
+  if (usable_(ctx, 'AUDIENCE')) {
+    var arows = readTable_(ctx.audit.getSheetByName('AUDIENCE')).rows.filter(function (r) { return r['ID']; });
+    var ar = latestBy_(arows, function (r) { return parseDateTime_(r['Snapshot']); });
     if (ar) {
       var a = audienceOf_(ar);
       var T = CONFIG.THRESHOLDS;
-      var mark = function (v, min) { return v === null ? '?' : pct_(v) + (v >= min ? ' ✓' : ' ✗'); };
-      lines['Latest audience'] = ar['ID'] + ' @ ' + (ar['Snapshot'] || '?') + ': female ' + mark(a.female, T.audienceFemaleMin) +
+      var mark = function (v, min) { return v === null ? NOT_RECORDED : pct_(v) + (v >= min ? ' ✓' : ' ✗'); };
+      lines['Latest audience'] = ar['ID'] + ' @ ' + (ar['Snapshot'] || NOT_RECORDED) + ': female ' + mark(a.female, T.audienceFemaleMin) +
         ', 45+ ' + mark(a.age45, T.audience45PlusMin) + ', US ' + mark(a.us, T.audienceUsMin) +
         (a.nonFollowers !== null ? ', non-followers ' + pct_(a.nonFollowers) : '');
     }
   }
 
-  var wk = ctx.audit.getSheetByName('WEEKLY REVIEW');
-  if (wk) {
-    var wrows = readTable_(wk).rows.filter(function (r) { return r['Window']; });
-    var w = wrows[wrows.length - 1];
+  if (usable_(ctx, 'WEEKLY REVIEW')) {
+    var wrows = readTable_(ctx.audit.getSheetByName('WEEKLY REVIEW')).rows.filter(function (r) { return r['Window']; });
+    var w = latestBy_(wrows, function (r) { var p = parsePeriod_(r['Window']); return p ? p.end : null; });
     if (w) {
-      var wv = parseNum_(w['Views']), pv = parseNum_(w['Profile views']);
+      var wv = parseNum_(w['Views']), pv = parseNum_(w['Profile views']), rw = parseNum_(w['Estimated rewards']);
       lines['Latest week'] = w['Window'] + ': ' + fmtInt_(wv) + ' views, ' + fmtInt_(pv) + ' profile views' +
         (wv && pv !== null ? ' (' + (pv / wv * 1000).toFixed(1) + ' per 1K views)' : '') +
-        ', ' + fmtInt_(parseNum_(w['Shares'])) + ' shares, FYP ' + (w['FYP'] || '?') + ', search ' + (w['Search'] || '?') +
+        ', ' + fmtInt_(parseNum_(w['Shares'])) + ' shares, FYP ' + (w['FYP'] || NOT_RECORDED) + ', search ' + (w['Search'] || NOT_RECORDED) +
+        '. Creator Rewards (est., separate from Shop commission): ' + (rw === null ? NOT_RECORDED : '$' + rw.toFixed(2)) +
         (w['Lesson / next decision'] ? '. Lesson: ' + w['Lesson / next decision'] : '');
     }
   }
 
-  var pending = function (sheetName, col) {
+  var waiting = function (sheetName, col) {
     return readTable_(mustSheet_(ctx.brain, sheetName)).rows.filter(function (r) {
-      var v = (r[col] || '').trim(); return !v || /pending/i.test(v);
+      return !DECIDED_STATUS.test((r[col] || '').trim());
     }).length;
   };
-  lines['Waiting for review'] = pending(BRAIN.RECS, 'Review status') + ' recommendations · ' +
-    pending(BRAIN.APPROVALS, 'Status') + ' approvals · ' + pending(BRAIN.RESEARCH, 'Status') + ' research items';
+  lines['Waiting for review'] = waiting(BRAIN.RECS, 'Review status') + ' recommendations · ' +
+    waiting(BRAIN.APPROVALS, 'Status') + ' approvals · ' + waiting(BRAIN.RESEARCH, 'Status') + ' research items';
 
   if (ctx.docs && ctx.docs.length) {
     lines['Reference docs'] = ctx.docs.map(function (d) {
-      return d.label + ': ' + (d.ok ? 'last edited ' + d.updated : 'unreadable (' + (d.error || '?') + ')');
+      return d.label + ': ' + (d.ok ? 'last edited ' + d.updated : 'unreadable (' + (d.error || 'unknown error') + ')');
     }).join(' · ');
   }
 
-  // Upsert "Auto · " rows; leave Becky's typed rows alone.
+  lines['Data checks'] = (ctx.dataNotes.length ? ctx.dataNotes.join('; ') : 'no snapshot date problems found') +
+    (ctx.warnings.length ? ' | Warnings: ' + ctx.warnings.length + ' (see CHANGE LOG)' : '');
+
+  upsertAutoRows_(sh, lines);
+}
+
+/** Update or append "Auto · " rows (columns A:B only). Refuses to write over a non-Auto row. */
+function upsertAutoRows_(sh, lines) {
   var values = sh.getDataRange().getDisplayValues();
   var rowOf = {};
-  values.forEach(function (r, i) { if (r[0]) rowOf[r[0]] = i + 1; });
+  values.forEach(function (r, i) {
+    var k = String(r[0] || '');
+    if (k.indexOf(AUTO_PREFIX) === 0 && !rowOf[k]) rowOf[k] = i + 1;
+  });
   var nextRow = sh.getLastRow() + 1;
   Object.keys(lines).forEach(function (k) {
     var key = AUTO_PREFIX + k;
     var row = rowOf[key];
     if (!row) { row = nextRow++; rowOf[key] = row; }
+    var a = sh.getRange(row, 1, 1, 2).getDisplayValues()[0];
+    var isEmpty = !String(a[0]).trim() && !String(a[1]).trim();
+    if (String(a[0]) !== key && !isEmpty) throw new Error('TODAY BRIEFING row ' + row + ' is not an Auto row; refusing to overwrite it.');
     sh.getRange(row, 1, 1, 2).setValues([[key, lines[k]]]);
   });
-  sh.getRange(1, 2).setValue('Manual rows seeded Nov 20 2026; "Auto ·" rows refreshed ' + ctx.now);
+}
+
+/**
+ * Latest TikTok Shop reporting period from SHOP KPI BASELINE, chosen by date:
+ *   valid row = Scope in CONFIG.SHOP_PERIOD_SCOPES, "Period / date" is a date
+ *   range, and at least one of GMV / items / clicks / commission is recorded.
+ *   Latest = latest end date; ties → longest window (most complete).
+ * Missing values are shown as "not recorded" (never 0). Shop commission is
+ * never combined with Creator Rewards.
+ */
+function describeShopPeriod_(ctx) {
+  var sh = ctx.audit.getSheetByName('SHOP KPI BASELINE');
+  var all = readTable_(sh).rows;
+  var scopes = CONFIG.SHOP_PERIOD_SCOPES.map(function (s) { return s.toLowerCase(); });
+  var valid = all.filter(function (r) {
+    if (scopes.indexOf(String(r['Scope'] || '').trim().toLowerCase()) === -1) return false;
+    var p = parsePeriod_(r['Period / date']);
+    if (!p || p.start === p.end) return false;
+    r._period = p;
+    return ['GMV USD', 'Attributed items', 'Product clicks', 'Est. commission USD'].some(function (c) { return parseNum_(r[c]) !== null; });
+  });
+  if (!valid.length) return 'No valid reporting period found (' + all.length + ' rows checked; need Scope "' + CONFIG.SHOP_PERIOD_SCOPES.join('" or "') + '" and a date range).';
+  valid.sort(function (a, b) {
+    if (a._period.end !== b._period.end) return b._period.end - a._period.end;
+    return a._period.start - b._period.start;
+  });
+  var s = valid[0];
+  var money = function (c) { var n = parseNum_(s[c]); return n === null ? NOT_RECORDED : '$' + n.toFixed(2); };
+  var count = function (c) { var n = parseNum_(s[c]); return n === null ? NOT_RECORDED : fmtInt_(n); };
+  return s['Period / date'] + ' (' + s['Scope'] + '): GMV ' + money('GMV USD') + ' (sales value, not earnings) · ' +
+    count('Attributed items') + ' attributed items · ' + count('Product clicks') + ' product clicks · CTR ' +
+    (s['Product card CTR'] || NOT_RECORDED) + ' · est. Shop commission ' + money('Est. commission USD') +
+    ' · evidence: ' + (s['Evidence label'] || NOT_RECORDED) +
+    '. Creator Rewards are tracked separately (WEEKLY REVIEW). [' + valid.length + ' reporting periods; ' +
+    (all.length - valid.length) + ' informational rows ignored]';
 }
 
 // ───────────────────────────── Helpers ───────────────────────────────────
@@ -840,6 +1032,25 @@ function readIds_(brain) {
   };
 }
 
+function isApproved_(v) { return /^approved$/i.test(String(v || '').trim()); }
+
+function ownedSheet_(sh, marker) {
+  var a1 = String(sh.getRange(1, 1).getDisplayValues()[0][0] || '');
+  return a1.indexOf(marker) === 0 || (sh.getLastRow() === 0);
+}
+
+/** Pads rows to the same width; returns the width. */
+function padRows_(rows) {
+  var width = rows.reduce(function (m, r) { return Math.max(m, r.length); }, 1);
+  rows.forEach(function (r) { while (r.length < width) r.push(''); });
+  return width;
+}
+
+function ensureSize_(sh, rows, cols) {
+  if (sh.getMaxRows() < rows) sh.insertRowsAfter(sh.getMaxRows(), rows - sh.getMaxRows());
+  if (sh.getMaxColumns() < cols) sh.insertColumnsAfter(sh.getMaxColumns(), cols - sh.getMaxColumns());
+}
+
 /** Set Value (col B) and optionally Status (col D) for a key in AI CONTROL CENTER. Pass null to leave a cell alone. */
 function setControl_(brain, key, value, status) {
   var sh = brain.getSheetByName(BRAIN.CONTROL);
@@ -849,6 +1060,21 @@ function setControl_(brain, key, value, status) {
     if (String(keys[i][0]).trim() === key) {
       if (value !== null && value !== undefined) sh.getRange(i + 1, 2).setValue(value);
       if (status !== null && status !== undefined) sh.getRange(i + 1, 4).setValue(status);
+      return;
+    }
+  }
+}
+
+/** On success: clear Last error, but say when an earlier error was resolved. */
+function clearLastError_(brain, now) {
+  var sh = brain.getSheetByName(BRAIN.CONTROL);
+  if (!sh) return;
+  var vals = sh.getRange(1, 1, Math.max(sh.getLastRow(), 1), 2).getDisplayValues();
+  for (var i = 0; i < vals.length; i++) {
+    if (String(vals[i][0]).trim() === 'Last error') {
+      var had = String(vals[i][1] || '').trim();
+      sh.getRange(i + 1, 2).setValue('');
+      sh.getRange(i + 1, 4).setValue(had ? 'Resolved ' + now + ' (details in CHANGE LOG)' : 'None');
       return;
     }
   }
@@ -888,12 +1114,96 @@ function tableFromValues_(values) {
   return { headers: headers, rows: rows, headerRow: h + 1 };
 }
 
-/** Append a row, putting each value under its header name. Unknown keys are ignored. */
+/** Append a row, putting each value under its header name. */
 function appendByHeaders_(sheet, obj) {
   var t = readTable_(sheet);
-  var row = t.headers.map(function (h) { return obj.hasOwnProperty(h) ? obj[h] : ''; });
-  if (!row.length) row = Object.keys(obj).map(function (k) { return obj[k]; });
-  sheet.appendRow(row);
+  var missing = Object.keys(obj).filter(function (k) { return t.headers.indexOf(k) === -1; });
+  if (missing.length) throw new Error('Tab "' + sheet.getName() + '" is missing column(s): ' + missing.join(', '));
+  sheet.appendRow(t.headers.map(function (h) { return obj.hasOwnProperty(h) ? obj[h] : ''; }));
+}
+
+/** Row with the largest timestamp; rows without one lose to rows with one; ties → lower row. */
+function latestBy_(rows, tsFn) {
+  var best = null, bestTs = null;
+  rows.forEach(function (r) {
+    var ts = tsFn(r);
+    if (!best) { best = r; bestTs = ts; return; }
+    if (ts !== null && (bestTs === null || ts >= bestTs)) { best = r; bestTs = ts; }
+    else if (ts === null && bestTs === null) { best = r; }
+  });
+  return best;
+}
+
+/** First "Nov 15[, 2026]" or "15 Nov [2026]" in s, or null. */
+function findMonthDay_(s) {
+  var re = /\b([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b(?:,?\s+(\d{4})\b)?/g, m;
+  while ((m = re.exec(s))) {
+    var mo = monthIdx_(m[1]);
+    if (mo !== null) return { mo: mo, d: +m[2], y: m[3] ? +m[3] : null, text: m[0] };
+  }
+  re = /\b(\d{1,2})\s+([A-Za-z]{3,9})\.?(?:\s+(\d{4})\b)?/g;
+  while ((m = re.exec(s))) {
+    var mo2 = monthIdx_(m[2]);
+    if (mo2 !== null) return { mo: mo2, d: +m[1], y: m[3] ? +m[3] : null, text: m[0] };
+  }
+  return null;
+}
+
+function monthIdx_(name) {
+  var k = String(name).slice(0, 3).toLowerCase();
+  return MONTHS_.hasOwnProperty(k) ? MONTHS_[k] : null;
+}
+
+var MONTHS_ = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+
+/**
+ * Parse a date and optional time from one or two strings into a sortable
+ * number (ms, naive local time). Accepts 2026-11-15, 2026/11/15, 11/15/2026,
+ * 11/15/26, 11/15, Nov 15, Nov 15 2026, November 15, 2026, 15 Nov 2026, plus
+ * times like 18:21, 6:21 pm, 6pm. Returns null when no date can be found.
+ */
+function parseDateTime_(dateStr, timeStr, defaultYear) {
+  var s = String(dateStr || '') + ' ' + String(timeStr || '');
+  var year = defaultYear || new Date().getFullYear();
+  var y = null, mo = null, d = null, m;
+  if ((m = s.match(/(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})/))) { y = +m[1]; mo = +m[2] - 1; d = +m[3]; s = s.replace(m[0], ' '); }
+  else if ((m = s.match(/\b(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\b/))) {
+    mo = +m[1] - 1; d = +m[2]; y = m[3] ? (+m[3] < 100 ? 2000 + +m[3] : +m[3]) : year; s = s.replace(m[0], ' ');
+  } else if ((m = findMonthDay_(s))) {
+    mo = m.mo; d = m.d; y = m.y || year; s = s.replace(m.text, ' ');
+  }
+  if (y === null || mo === null || d === null || mo < 0 || mo > 11 || d < 1 || d > 31) return null;
+  var hh = 0, mi = 0;
+  if ((m = s.match(/\b(\d{1,2}):(\d{2})(?::\d{2})?\s*(am|pm|a\.m\.|p\.m\.)?/i))) {
+    hh = +m[1]; mi = +m[2];
+    if (m[3]) { var pm = /^p/i.test(m[3]); if (pm && hh < 12) hh += 12; if (!pm && hh === 12) hh = 0; }
+  } else if ((m = s.match(/\b(\d{1,2})\s*(am|pm)\b/i))) {
+    hh = +m[1] % 12 + (/pm/i.test(m[2]) ? 12 : 0);
+  }
+  return Date.UTC(y, mo, d, hh, mi);
+}
+
+/**
+ * Parse a period like "2026-11-01 to 11-17", "2026-10-01 to 2026-10-31",
+ * "Nov 7–Nov 13", "Nov 7-13". Returns {start, end} (ms) or null. A single
+ * date returns start === end.
+ */
+function parsePeriod_(str) {
+  var s = String(str || '').trim();
+  if (!s) return null;
+  var parts = s.split(/\s+to\s+|\s*[–—]\s*|\s+-\s+/i);
+  var short = parts.length < 2 && s.match(/^([A-Za-z]{3,9}\.?\s+\d{1,2})-(\d{1,2})\b/); // "Nov 7-13"
+  if (short) parts = [short[1], short[2]];
+  var start = parseDateTime_(parts[0]);
+  if (start === null) return null;
+  if (parts.length < 2) return { start: start, end: start };
+  var sd = new Date(start);
+  var tail = parts[1].trim(), end = null, m;
+  if ((m = tail.match(/^(\d{1,2})-(\d{1,2})$/))) end = Date.UTC(sd.getUTCFullYear(), +m[1] - 1, +m[2]);
+  else if ((m = tail.match(/^(\d{1,2})$/))) end = Date.UTC(sd.getUTCFullYear(), sd.getUTCMonth(), +m[1]);
+  else end = parseDateTime_(tail, '', sd.getUTCFullYear());
+  if (end === null || end < start) return null;
+  return { start: start, end: end };
 }
 
 /** "48,600." → 48600 · "10.6K" → 10600 · "1.2M" → 1200000 · "" → null */
@@ -920,7 +1230,7 @@ function parsePct_(v) {
 function pct_(x) { return Math.round(x * 1000) / 10 + '%'; }
 
 function fmtInt_(n) {
-  return n === null || n === undefined ? '?' : Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return n === null || n === undefined ? NOT_RECORDED : Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 }
 
 function sha256_(s) {
