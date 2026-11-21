@@ -21,7 +21,12 @@ The script reads all IDs from **AI CONTROL CENTER**. The IDs in `CONFIG.FALLBACK
   - 3-second retention below 70%
 - `RESEARCH QUEUE`: finished CREATIVE TESTS and SHOP CREATIVE TESTS, waiting for a human to decide whether they become a rule (BR-11).
 - `AI RECOMMENDATIONS › Decision / notes`: results Becky types in Audit › CREATIVE TESTS for `AUTO-` tests.
-- `TODAY BRIEFING`: only rows starting with `Auto ·` are written. Manual rows are left alone.
+  - an AUDIENCE reading below target: female < 70%, age 45+ < 60% or US < 80%
+- `AUDIT KNOWLEDGE` (new tab, read-only, written by the script): a copy of VISUAL STYLE GUIDE, CREATOR TRAINING LAB, VIDEO PRODUCTION SPECS, SEO & HOOKS, COMMENT INSIGHTS and INSPIRATION BANK. It's refreshed whenever one of those tabs changes.
+- `APPROVAL QUEUE` (*Pending review*): each **new** row in INSPIRATION BANK, CREATOR TRAINING LAB or VISUAL STYLE GUIDE becomes a `KNOW-…` proposal. Rows that already exist at the first sync are treated as seen. To queue them too, set `QUEUE_EXISTING_KNOWLEDGE_ON_FIRST_SYNC: true` before the first run.
+- `VIDEO EDITING RULES`: when you set a `KNOW-…` proposal to **Approved**, it's added here once, using its Audit ID (e.g. `TR-15`). It then reaches the Audit workbook through `BIRDIE SYNC`.
+- `SOURCE INDEX`: START HERE, DASHBOARD, MIRROR & FUNNELS, MARKETING FUNNELS and YAPPING 10-DAY PLAN are listed once with direct links. They're for reference only and aren't synced.
+- `TODAY BRIEFING`: only rows starting with `Auto ·` are written, including the latest audience mix (✓/✗ against target) and the latest week with profile views per 1K views. Manual rows are left alone.
 
 **Brain ➜ Audit**
 - `BIRDIE SYNC` tab (created automatically and overwritten on every run): Brand rules, Video editing rules, approved Approval Queue items and approved AI recommendations.
@@ -57,5 +62,8 @@ The script reads all IDs from **AI CONTROL CENTER**. The IDs in `CONFIG.FALLBACK
 
 Edit `CONFIG` at the top of `Code.gs`:
 - `DAILY_HOUR`
-- `THRESHOLDS`
+- `THRESHOLDS` (follow rate, retention, audience targets)
+- `KNOWLEDGE_TABS`
+- `PROPOSE_FROM_TABS`
+- `REFERENCE_ONLY_TABS`
 - `AUDIT_TABS_WATCHED`

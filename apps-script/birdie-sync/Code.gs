@@ -52,16 +52,46 @@ var CONFIG = {
   AUDIT_TABS_WATCHED: [
     'POST LOG', 'SNAPSHOTS', 'AUDIENCE', 'RETENTION', 'CREATIVE TESTS',
     'COMMENT INSIGHTS', 'WEEKLY REVIEW', 'SEO & HOOKS',
-    'SHOP KPI BASELINE', 'SHOP VIDEO AUDIT', 'SHOP CREATIVE TESTS'
+    'SHOP KPI BASELINE', 'SHOP VIDEO AUDIT', 'SHOP CREATIVE TESTS',
+    'INSPIRATION BANK', 'VISUAL STYLE GUIDE', 'CREATOR TRAINING LAB', 'VIDEO PRODUCTION SPECS'
   ],
+
+  // Audit tabs copied (read-only) into Birdie Brain › AUDIT KNOWLEDGE.
+  KNOWLEDGE_TABS: [
+    'VISUAL STYLE GUIDE', 'CREATOR TRAINING LAB', 'VIDEO PRODUCTION SPECS',
+    'SEO & HOOKS', 'COMMENT INSIGHTS', 'INSPIRATION BANK'
+  ],
+
+  // New rows in these Audit tabs are proposed in APPROVAL QUEUE.
+  // When approved, they're added to VIDEO EDITING RULES.
+  PROPOSE_FROM_TABS: ['INSPIRATION BANK', 'CREATOR TRAINING LAB', 'VISUAL STYLE GUIDE'],
+
+  // false = rows that already exist at the first sync are treated as seen (not queued).
+  QUEUE_EXISTING_KNOWLEDGE_ON_FIRST_SYNC: false,
+
+  // Audit tabs listed in SOURCE INDEX for reference only (not synced).
+  REFERENCE_ONLY_TABS: {
+    'START HERE': ['Definitions, follow-rate formula, which tab wins', 'When a definition or tab authority is unclear'],
+    'DASHBOARD': ['Summary of POST LOG, SNAPSHOTS and WEEKLY REVIEW (not a source of truth)', 'Quick overview only'],
+    'MIRROR & FUNNELS': ['Main funnel tab: stages, metrics, decision rules', 'Before judging a post by its funnel job'],
+    'MARKETING FUNNELS': ['Summary of funnel models; defers to MIRROR & FUNNELS', 'Background reading'],
+    'YAPPING 10-DAY PLAN': ['Short-term talking-video plan', 'While the 10-day plan is running']
+  },
 
   // Script-owned tab created in the Audit workbook. Never watched.
   MIRROR_TAB: 'BIRDIE SYNC',
 
+  // Script-owned tab created in Birdie Brain.
+  KNOWLEDGE_MIRROR_TAB: 'AUDIT KNOWLEDGE',
+
   THRESHOLDS: {
     minViewsForRate: 1000,     // don't judge follow rate below this many views
     followsPer1kLow: 1.0,      // flag follow conversion below this
-    threeSecRetentionLow: 0.70 // flag 3-sec retention below 70%
+    threeSecRetentionLow: 0.70, // flag 3-sec retention below 70%
+    // Audience fit (Gen X midlife women, US). Flagged when a reading falls below.
+    audienceFemaleMin: 0.70,
+    audience45PlusMin: 0.60,
+    audienceUsMin: 0.80
   },
 
   APPEND_APPROVED_TO_CREATIVE_TESTS: true
@@ -115,7 +145,8 @@ function refreshBirdieBrain() {
       now: nowUtc_(),
       today: Utilities.formatDate(new Date(), 'UTC', 'yyyy-MM-dd'),
       props: PropertiesService.getScriptProperties(),
-      stats: { changedTabs: [], recs: 0, research: 0, pushedTests: 0, resultsBack: 0, docsChanged: [] }
+      stats: { changedTabs: [], recs: 0, research: 0, pushedTests: 0, resultsBack: 0, docsChanged: [],
+               proposals: 0, rulesAdded: 0, knowledgeMirrored: false }
     };
 
     // Audit ➜ Brain
@@ -123,6 +154,10 @@ function refreshBirdieBrain() {
     ctx.docs = snapshotReferenceDocs_(ctx);
     if (ctx.stats.changedTabs.length) runAuditRules_(ctx);
     syncTestResultsBack_(ctx);
+    mirrorAuditKnowledge_(ctx);
+    proposeNewKnowledge_(ctx);
+    promoteApprovedKnowledge_(ctx);
+    indexReferenceTabs_(ctx);
 
     // Brain ➜ Audit
     pushApprovedToAudit_(ctx);
@@ -140,7 +175,9 @@ function refreshBirdieBrain() {
       'Changed tabs: ' + (s.changedTabs.join(', ') || 'none') +
       ' | docs changed: ' + (s.docsChanged.join(', ') || 'none') +
       ' | new recs: ' + s.recs + ' | research items: ' + s.research +
-      ' | tests pushed: ' + s.pushedTests + ' | results synced back: ' + s.resultsBack,
+      ' | tests pushed: ' + s.pushedTests + ' | results synced back: ' + s.resultsBack +
+      ' | knowledge proposals: ' + s.proposals + ' | rules added: ' + s.rulesAdded +
+      ' | AUDIT KNOWLEDGE ' + (s.knowledgeMirrored ? 'refreshed' : 'unchanged'),
       'OK', '');
   } catch (err) {
     var msg = String(err && err.stack ? err.stack : err);
@@ -338,6 +375,24 @@ function runAuditRules_(ctx) {
     });
   }
 
+  // Audience fit.
+  if (changed['AUDIENCE']) {
+    readTable_(ctx.audit.getSheetByName('AUDIENCE')).rows.forEach(function (r) {
+      var pid = r['ID']; if (!pid) return;
+      var a = audienceOf_(r);
+      var misses = [];
+      if (a.female !== null && a.female < T.audienceFemaleMin) misses.push('female ' + pct_(a.female) + ' (target ≥ ' + pct_(T.audienceFemaleMin) + ')');
+      if (a.age45 !== null && a.age45 < T.audience45PlusMin) misses.push('age 45+ ' + pct_(a.age45) + ' (target ≥ ' + pct_(T.audience45PlusMin) + ')');
+      if (a.us !== null && a.us < T.audienceUsMin) misses.push('US ' + pct_(a.us) + ' (target ≥ ' + pct_(T.audienceUsMin) + ')');
+      if (!misses.length) return;
+      addRec('audience-drift|' + pid + '|' + (r['Snapshot'] || ''),
+        pid + ' audience at ' + (r['Snapshot'] || '?') + ' is off target: ' + misses.join('; ') + ' (OBSERVED).',
+        'Check whether the hook, sound or topic pulled a different crowd. Next comparable post: open on a scene specific to Gen X midlife women (BR-04) and compare audience mix at a similar reading.',
+        'HYPOTHESIS', 'Audit › AUDIENCE; MIRROR & FUNNELS › AUDIENCE; BR-01; BR-04',
+        'Female ≥ ' + pct_(T.audienceFemaleMin) + ', 45+ ≥ ' + pct_(T.audience45PlusMin) + ', US ≥ ' + pct_(T.audienceUsMin));
+    });
+  }
+
   // Finished experiments → research queue for a human decision about promoting them to a rule.
   var research = mustSheet_(ctx.brain, BRAIN.RESEARCH);
   var researchNotes = readTable_(research).rows.map(function (r) { return r['Notes'] || ''; }).join('\n');
@@ -427,6 +482,182 @@ function syncTestResultsBack_(ctx) {
     var next = (cleaned ? cleaned + '\n' : '') + '[synced ' + ctx.today + '] ' + line;
     recSheet.getRange(r._row, notesCol + 1).setValue(next);
     ctx.stats.resultsBack++;
+  });
+}
+
+/** Female / 45+ / US shares from an AUDIENCE row (45+ is summed from age bands when the total is blank). */
+function audienceOf_(r) {
+  var age45 = parsePct_(r['45+ total']);
+  if (age45 === null) {
+    var a = parsePct_(r['45–54']), b = parsePct_(r['55+']);
+    if (a !== null && b !== null) age45 = a + b;
+  }
+  return { female: parsePct_(r['Female']), age45: age45, us: parsePct_(r['USA']), nonFollowers: parsePct_(r['Non-followers']) };
+}
+
+/** Read-only copy of the Audit knowledge tabs in Birdie Brain › AUDIT KNOWLEDGE. */
+function mirrorAuditKnowledge_(ctx) {
+  var target = ctx.brain.getSheetByName(CONFIG.KNOWLEDGE_MIRROR_TAB);
+  var changed = ctx.stats.changedTabs.some(function (n) { return CONFIG.KNOWLEDGE_TABS.indexOf(n) !== -1; });
+  if (target && !changed) return;
+
+  var rows = [['AUDIT KNOWLEDGE — copied from the Audit workbook by the Birdie Brain Apps Script. Don\'t edit here: this tab is overwritten whenever a source tab changes. Edit the Audit workbook instead.',
+    'Last copied: ' + ctx.now]];
+  var bands = [];
+  CONFIG.KNOWLEDGE_TABS.forEach(function (name) {
+    var sh = ctx.audit.getSheetByName(name);
+    rows.push(['']);
+    if (!sh) { rows.push([name + ' — tab not found in Audit workbook']); return; }
+    var t = readTable_(sh);
+    var cols = t.headers.filter(String);
+    bands.push(rows.length + 1);
+    rows.push([name + ' (' + t.rows.length + ' rows) — ' + 'https://docs.google.com/spreadsheets/d/' + ctx.ids.audit + '/edit#gid=' + sh.getSheetId()]);
+    rows.push(cols);
+    t.rows.forEach(function (r) { rows.push(cols.map(function (c) { return r[c] || ''; })); });
+  });
+  var width = rows.reduce(function (m, r) { return Math.max(m, r.length); }, 1);
+  rows = rows.map(function (r) { while (r.length < width) r.push(''); return r; });
+
+  target = target || ctx.brain.insertSheet(CONFIG.KNOWLEDGE_MIRROR_TAB);
+  target.clear();
+  target.getRange(1, 1, rows.length, width).setValues(rows);
+  target.setFrozenRows(1);
+  target.getRange(1, 1, 1, width).setFontWeight('bold');
+  bands.forEach(function (r) {
+    target.getRange(r, 1, 1, width).setFontWeight('bold').setBackground('#FFF4D6');
+    target.getRange(r + 1, 1, 1, width).setFontWeight('bold');
+  });
+  ctx.stats.knowledgeMirrored = true;
+}
+
+/** Stable identity for a knowledge row: its ID column, else a hash of its contents. */
+function knowledgeRowId_(tab, t, r) {
+  var idCol = t.headers[0];
+  var id = r[idCol];
+  return id ? id : 'ROW-' + sha256_(tab + JSON.stringify(r)).slice(0, 8);
+}
+
+/** Readable proposal text for a new knowledge row. */
+function describeKnowledge_(tab, r) {
+  var pick = function (label, key) { return r[key] ? label + r[key] : ''; };
+  var join = function (parts) { return parts.filter(String).join(' · '); };
+  if (tab === 'INSPIRATION BANK') return {
+    change: join(['Inspiration idea' + (r['Theme / territory'] ? ' (' + r['Theme / territory'] + ')' : ''),
+      pick('Becky direction: ', 'Original Becky direction (idea only)'), pick('Hook: ', 'Hook / psychology'),
+      pick('Mirror: ', 'Audience mirror'), pick('Pillar: ', 'Content pillar')]),
+    why: join([pick('Why it caught attention: ', 'Why it caught attention'), pick('Attribution: ', 'Source attribution'), pick('Audit status: ', 'Status')])
+  };
+  if (tab === 'CREATOR TRAINING LAB') return {
+    change: join([(r['Category'] ? r['Category'] + ': ' : '') + (r['Rule / learning'] || ''),
+      pick('Apply: ', 'Becky application'), pick('Standard: ', 'Execution standard'), pick('Measure: ', 'Test / measurement')]),
+    why: join([pick('Observed: ', 'Observed evidence'), pick('Source: ', 'Source / reference'), pick('Audit status: ', 'Status')])
+  };
+  if (tab === 'VISUAL STYLE GUIDE') return {
+    change: join([(r['Style element'] || 'Visual style') + ': ' + [r['Color name'], r['Approx. HEX']].filter(String).join(' '),
+      pick('Treatment: ', 'Visual treatment'), pick('Best use: ', 'Best use'), pick('Readability: ', 'Contrast / readability'), pick('Guidance: ', 'Brand guidance')]),
+    why: join([pick('Source: ', 'Source image'), pick('Audit status: ', 'Status')])
+  };
+  return { change: Object.keys(r).filter(function (k) { return k !== '_row' && r[k]; }).map(function (k) { return k + ': ' + r[k]; }).join(' · '), why: '' };
+}
+
+/** New rows in INSPIRATION BANK / CREATOR TRAINING LAB / VISUAL STYLE GUIDE → APPROVAL QUEUE (Pending review). */
+function proposeNewKnowledge_(ctx) {
+  var queue = mustSheet_(ctx.brain, BRAIN.APPROVALS);
+  var queued = {};
+  readTable_(queue).rows.forEach(function (r) { if (r['Proposal ID']) queued[r['Proposal ID']] = true; });
+  var all = ctx.props.getProperties();
+  var newProps = {};
+
+  CONFIG.PROPOSE_FROM_TABS.forEach(function (tab) {
+    var sh = ctx.audit.getSheetByName(tab);
+    if (!sh) return;
+    var baselineKey = 'baseline:knowledge:' + tab;
+    var firstSync = !all[baselineKey];
+    if (!firstSync && ctx.stats.changedTabs.indexOf(tab) === -1) return;
+
+    var t = readTable_(sh);
+    t.rows.forEach(function (r) {
+      var rowId = knowledgeRowId_(tab, t, r);
+      var pid = 'KNOW-' + sha256_(tab + '|' + rowId).slice(0, 8);
+      var seenKey = 'seen:' + pid;
+      if (all[seenKey] || queued[pid]) return;
+      newProps[seenKey] = '1';
+      if (firstSync && !CONFIG.QUEUE_EXISTING_KNOWLEDGE_ON_FIRST_SYNC) return;
+      var d = describeKnowledge_(tab, r);
+      appendByHeaders_(queue, {
+        'Created UTC': ctx.now,
+        'Proposal ID': pid,
+        'Proposed change': d.change,
+        'Source / reasoning': 'Audit › ' + tab + ' › ' + rowId + (d.why ? ' — ' + d.why : ''),
+        'Status': 'Pending review',
+        'Reviewed by': '', 'Reviewed at': '',
+        'Notes': 'Approve to add to VIDEO EDITING RULES as ' + rowId + '. Reject to leave it in the Audit workbook only.'
+      });
+      queued[pid] = true;
+      ctx.stats.proposals++;
+    });
+    if (firstSync) newProps[baselineKey] = ctx.now;
+  });
+  if (Object.keys(newProps).length) ctx.props.setProperties(newProps);
+}
+
+/** Approved KNOW- proposals become VIDEO EDITING RULES rows (once each). */
+function promoteApprovedKnowledge_(ctx) {
+  var queue = readTable_(mustSheet_(ctx.brain, BRAIN.APPROVALS));
+  var approved = queue.rows.filter(function (r) {
+    return /^KNOW-/.test(r['Proposal ID'] || '') && /^\s*approved/i.test(r['Status'] || '');
+  });
+  if (!approved.length) return;
+  var rulesSheet = mustSheet_(ctx.brain, BRAIN.EDITING);
+  var rules = readTable_(rulesSheet);
+  var have = {};
+  rules.rows.forEach(function (r) { have[r[rules.headers[0]]] = true; });
+  var labels = { 'INSPIRATION BANK': 'Inspiration idea', 'CREATOR TRAINING LAB': 'Creator training', 'VISUAL STYLE GUIDE': 'Visual style' };
+  approved.forEach(function (r) {
+    var m = String(r['Source / reasoning'] || '').match(/^Audit › (.+?) › (\S+)/);
+    var tab = m ? m[1] : '';
+    var ruleId = m ? m[2] : r['Proposal ID'];
+    if (have[ruleId]) return;
+    appendByHeaders_(rulesSheet, {
+      'Rule ID': ruleId,
+      'Task': labels[tab] || tab || 'Approved knowledge',
+      'Workflow': r['Proposed change'],
+      'Evidence required': (r['Source / reasoning'] || '') + ' | approved ' + (r['Reviewed at'] || ctx.today) + (r['Reviewed by'] ? ' by ' + r['Reviewed by'] : ''),
+      'Avoid': ''
+    });
+    have[ruleId] = true;
+    ctx.stats.rulesAdded++;
+    logChange_(ctx.brain, 'promote-rule', BRAIN.EDITING, ruleId + ' added from ' + r['Proposal ID'], 'OK', '');
+  });
+}
+
+/** List reference-only Audit tabs in SOURCE INDEX (added once each, never synced). */
+function indexReferenceTabs_(ctx) {
+  var sh = ctx.brain.getSheetByName(BRAIN.SOURCES);
+  if (!sh) return;
+  var t = readTable_(sh);
+  var names = {}, maxN = 0;
+  t.rows.forEach(function (r) {
+    names[r['Name']] = true;
+    var m = String(r['Source ID'] || '').match(/^S-(\d+)$/);
+    if (m) maxN = Math.max(maxN, parseInt(m[1], 10));
+  });
+  Object.keys(CONFIG.REFERENCE_ONLY_TABS).forEach(function (tab) {
+    var name = 'Audit › ' + tab;
+    if (names[name]) return;
+    var tabSheet = ctx.audit.getSheetByName(tab);
+    if (!tabSheet) return;
+    var info = CONFIG.REFERENCE_ONLY_TABS[tab];
+    maxN++;
+    appendByHeaders_(sh, {
+      'Source ID': 'S-' + (maxN < 10 ? '0' : '') + maxN,
+      'Type': 'Sheet tab (reference only)',
+      'Name': name,
+      'URL': 'https://docs.google.com/spreadsheets/d/' + ctx.ids.audit + '/edit#gid=' + tabSheet.getSheetId(),
+      'Data authority': info[0],
+      'Read when': info[1]
+    });
+    names[name] = true;
   });
 }
 
@@ -531,6 +762,33 @@ function updateBriefing_(ctx) {
     if (s) lines['Latest Shop period'] = s['Period / date'] + ': GMV $' + (s['GMV USD'] || '?') + ', ' +
       (s['Attributed items'] || '?') + ' items, ' + (s['Product clicks'] || '?') + ' clicks, CTR ' +
       (s['Product card CTR'] || '?') + ', est. commission $' + (s['Est. commission USD'] || '?') + ' (' + (s['Evidence label'] || 'unlabeled') + ')';
+  }
+
+  var aud = ctx.audit.getSheetByName('AUDIENCE');
+  if (aud) {
+    var arows = readTable_(aud).rows.filter(function (r) { return r['ID']; });
+    var ar = arows[arows.length - 1];
+    if (ar) {
+      var a = audienceOf_(ar);
+      var T = CONFIG.THRESHOLDS;
+      var mark = function (v, min) { return v === null ? '?' : pct_(v) + (v >= min ? ' ✓' : ' ✗'); };
+      lines['Latest audience'] = ar['ID'] + ' @ ' + (ar['Snapshot'] || '?') + ': female ' + mark(a.female, T.audienceFemaleMin) +
+        ', 45+ ' + mark(a.age45, T.audience45PlusMin) + ', US ' + mark(a.us, T.audienceUsMin) +
+        (a.nonFollowers !== null ? ', non-followers ' + pct_(a.nonFollowers) : '');
+    }
+  }
+
+  var wk = ctx.audit.getSheetByName('WEEKLY REVIEW');
+  if (wk) {
+    var wrows = readTable_(wk).rows.filter(function (r) { return r['Window']; });
+    var w = wrows[wrows.length - 1];
+    if (w) {
+      var wv = parseNum_(w['Views']), pv = parseNum_(w['Profile views']);
+      lines['Latest week'] = w['Window'] + ': ' + fmtInt_(wv) + ' views, ' + fmtInt_(pv) + ' profile views' +
+        (wv && pv !== null ? ' (' + (pv / wv * 1000).toFixed(1) + ' per 1K views)' : '') +
+        ', ' + fmtInt_(parseNum_(w['Shares'])) + ' shares, FYP ' + (w['FYP'] || '?') + ', search ' + (w['Search'] || '?') +
+        (w['Lesson / next decision'] ? '. Lesson: ' + w['Lesson / next decision'] : '');
+    }
   }
 
   var pending = function (sheetName, col) {
@@ -658,6 +916,8 @@ function parsePct_(v) {
   if (String(v).indexOf('%') !== -1 || n > 1) return n / 100;
   return n;
 }
+
+function pct_(x) { return Math.round(x * 1000) / 10 + '%'; }
 
 function fmtInt_(n) {
   return n === null || n === undefined ? '?' : Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
